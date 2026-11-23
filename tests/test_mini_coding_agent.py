@@ -1,8 +1,9 @@
 import contextlib
 import io
 import json
-import pytest
 from unittest.mock import patch
+
+import pytest
 
 from mini_coding_agent import (
     FakeModelClient,

@@ -1,7 +1,7 @@
 import argparse
 import json
-import re
 import math
+import re
 import shutil
 import subprocess
 import sys
@@ -10,7 +10,6 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-
 
 DOC_NAMES = ("AGENTS.md", "README.md", "pyproject.toml", "package.json")
 HELP_TEXT = "/help, /memory, /session, /reset, /skills, /skill, /skill-logs, /exit"
