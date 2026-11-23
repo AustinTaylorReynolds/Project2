@@ -799,6 +799,28 @@ class MiniAgent:
                     "error: use_skill limit reached for this task; "
                     "use delegate, read_file, write_file, patch_file, or run_shell instead."
                 )
+        if name == "delegate" and str((args or {}).get("agent", "")).strip():
+            agent_key = normalize_skill_name(args["agent"])
+            task_key = str(args.get("task", "")).strip()
+            completed = set()
+            already_ran_same = False
+            for item in self.session["history"]:
+                if item["role"] != "tool" or item["name"] != "delegate":
+                    continue
+                prior_agent = normalize_skill_name((item.get("args") or {}).get("agent", ""))
+                prior_task = str((item.get("args") or {}).get("task", "")).strip()
+                content = str(item.get("content", ""))
+                if prior_agent and not content.startswith("error:"):
+                    completed.add(prior_agent)
+                    if prior_agent == agent_key and prior_task == task_key:
+                        already_ran_same = True
+            if already_ran_same:
+                remaining = [sub for sub in self.available_subagents() if sub not in completed]
+                rem_text = ", ".join(remaining) if remaining else "none"
+                return (
+                    f"error: sub-agent '{agent_key}' already completed this task "
+                    f"(remaining sub-agents: {rem_text}); delegate to the next sub-agent or run verification."
+                )
         if self.repeated_tool_call(name, args):
             return f"error: repeated identical tool call for {name}; choose a different tool or return a final answer"
         if tool["risky"] and not self.approve(name, args):
@@ -823,7 +845,7 @@ class MiniAgent:
             "run_shell": '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
             "write_file": '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
             "patch_file": '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
-            "delegate": '<tool>{"name":"delegate","args":{"agent":"q-table-setup","task":"Implement your component as described in your instructions."}}</tool>',
+            "delegate": '<tool>{"name":"delegate","args":{"agent":"<sub-agent-name>","task":"Implement your component."}}</tool>',
             "use_skill": '<tool>{"name":"use_skill","args":{"skill":"%s"}}</tool>' % (self.skills.names()[0] if self.skills else "pr-review"),
         }
         return examples.get(name, "")
@@ -902,7 +924,8 @@ class MiniAgent:
                 raise ValueError("task must not be empty")
             agent_name = str(args.get("agent", "")).strip()
             if agent_name and self.find_subagent_file(agent_name) is None:
-                raise ValueError(f"unknown sub-agent '{agent_name}'")
+                available = ", ".join(self.available_subagents()) or "none"
+                raise ValueError(f"unknown sub-agent '{agent_name}'; available: {available}")
             return
 
     def approve(self, name, args):
@@ -969,6 +992,21 @@ class MiniAgent:
         # Small models often write attribute-only calls: <tool name="delegate" agent="x" task="y"/>
         # (self-closing) or forget </tool>. Accept those, but never act on a body cut off mid-way,
         # because that would write half a file and report success.
+        hybrid = re.search(
+            r"""<tool\s+name\s*=\s*(?:"([^"]+)"|'([^']+)')\s+args\s*=\s*""",
+            raw,
+        )
+        if hybrid:
+            name = (hybrid.group(1) or hybrid.group(2) or "").strip()
+            after = raw[hybrid.end() :].lstrip()
+            if name and after.startswith("{"):
+                try:
+                    parsed_args, _ = json.JSONDecoder().raw_decode(after)
+                except json.JSONDecodeError:
+                    return None
+                if isinstance(parsed_args, dict):
+                    return {"name": name, "args": parsed_args}
+                return None
         opening = re.search(r"""<tool(?P<attrs>(?:[^>"']|"[^"]*"|'[^']*')*)>""", raw)
         if not opening:
             return None
@@ -1144,6 +1182,12 @@ class MiniAgent:
     def tool_write_file(self, args):
         path = self.path(args["path"])
         content = str(args["content"])
+        if path.suffix.lower() != ".md":
+            stripped = content.strip()
+            if stripped.startswith("```") and stripped.endswith("```"):
+                lines = stripped.splitlines()
+                if len(lines) >= 2:
+                    content = "\n".join(lines[1:-1]) + "\n"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         return f"wrote {path.relative_to(self.root)} ({len(content)} chars)"
@@ -1311,11 +1355,8 @@ class MiniAgent:
     ###################################################
     #### 6) Delegation And Bounded Subagents ##########
     ###################################################
-    def find_subagent_file(self, agent_name):
-        """Locate <agent_name>.md inside .claude/agents/ near the workspace or any discovered skill."""
-        target = normalize_skill_name(str(agent_name).removesuffix(".md"))
-        if not target:
-            return None
+    def subagent_files(self):
+        """Return {normalized_name: Path} for .claude/agents/*.md near the workspace or discovered skills."""
         candidate_dirs = [
             Path(self.workspace.cwd) / ".claude" / "agents",
             self.root / ".claude" / "agents",
@@ -1324,7 +1365,7 @@ class MiniAgent:
             # If skills live in <repo>/.claude/skills/<name>, look in <repo>/.claude/agents
             candidate_dirs.append(skill.folder.parent.parent / "agents")
             candidate_dirs.append(skill.folder.parent.parent / ".claude" / "agents")
-        seen = set()
+        found, seen = {}, set()
         for directory in candidate_dirs:
             try:
                 directory = directory.resolve()
@@ -1332,15 +1373,21 @@ class MiniAgent:
                     continue
                 seen.add(directory)
                 for item in sorted(directory.iterdir()):
-                    if (
-                        item.is_file()
-                        and item.suffix.lower() == ".md"
-                        and normalize_skill_name(item.stem) == target
-                    ):
-                        return item
+                    if item.is_file() and item.suffix.lower() == ".md":
+                        found.setdefault(normalize_skill_name(item.stem), item)
             except OSError:
                 continue
-        return None
+        return found
+
+    def available_subagents(self):
+        return sorted(self.subagent_files())
+
+    def find_subagent_file(self, agent_name):
+        """Locate <agent_name>.md inside .claude/agents/ near the workspace or any discovered skill."""
+        target = normalize_skill_name(str(agent_name).removesuffix(".md"))
+        if not target:
+            return None
+        return self.subagent_files().get(target)
 
     def tool_delegate(self, args):
         if self.depth >= self.max_depth:
