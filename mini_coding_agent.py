@@ -786,6 +786,19 @@ class MiniAgent:
             if example:
                 message += f"\nexample: {example}"
             return message
+        if name == "use_skill" and not str((args or {}).get("file", "")).strip():
+            prior_skill_calls = sum(
+                1
+                for item in reversed(self.session["history"])
+                if item["role"] == "tool"
+                and item["name"] == "use_skill"
+                and not str((item.get("args") or {}).get("file", "")).strip()
+            )
+            if prior_skill_calls >= 3:
+                return (
+                    "error: use_skill limit reached for this task; "
+                    "use delegate, read_file, write_file, patch_file, or run_shell instead."
+                )
         if self.repeated_tool_call(name, args):
             return f"error: repeated identical tool call for {name}; choose a different tool or return a final answer"
         if tool["risky"] and not self.approve(name, args):
@@ -810,7 +823,7 @@ class MiniAgent:
             "run_shell": '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
             "write_file": '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
             "patch_file": '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
-            "delegate": '<tool>{"name":"delegate","args":{"task":"inspect README.md","max_steps":3}}</tool>',
+            "delegate": '<tool>{"name":"delegate","args":{"agent":"q-table-setup","task":"Implement your component as described in your instructions."}}</tool>',
             "use_skill": '<tool>{"name":"use_skill","args":{"skill":"%s"}}</tool>' % (self.skills.names()[0] if self.skills else "pr-review"),
         }
         return examples.get(name, "")
@@ -1236,6 +1249,11 @@ class MiniAgent:
             )
             return content
         already = skill.name in self.session["active_skills"]
+        if already:
+            return (
+                f"error: skill '{skill.name}' is already active. Do not call use_skill for it again; "
+                "use delegate, read_file, write_file, or run_shell to follow its instructions."
+            )
         self.activate_skill(skill.name)
         self.record_skill_event(
             prompt=prompt,
@@ -1243,13 +1261,7 @@ class MiniAgent:
             executed_skill=skill,
             trigger="model_tool",
         )
-        if not already:
-            self.log_skill(f"activated '{skill.name}' (requested by the model)")
-        if already:
-            return (
-                f"skill '{skill.name}' is already active. Do not call use_skill for it again: "
-                "carry out the next step of its instructions under 'Active skills' with your other tools."
-            )
+        self.log_skill(f"activated '{skill.name}' (requested by the model)")
         return (
             f"skill '{skill.name}' is now active. "
             "Its full instructions are shown under 'Active skills' in the prompt; follow them for this task."
