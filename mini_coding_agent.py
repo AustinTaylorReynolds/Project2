@@ -1,7 +1,7 @@
 import argparse
 import json
-import math
 import re
+import math
 import shutil
 import subprocess
 import sys
@@ -22,18 +22,16 @@ WELCOME_ART = (
     "\\\\  \\|/  /",
     "`-----'__",
 )
-HELP_DETAILS = "\n".join(
-    [
-        "Commands:",
-        "/help        Show this help message.",
-        "/memory      Show the agent's distilled working memory.",
-        "/session     Show the path to the saved session file.",
-        "/reset       Clear the current session history and memory.",
-        "/skills      List the agent skills that were discovered.",
-        "/skill       Activate a skill: /skill <name> [request] (or /<name> [request]).",
-        "/skill-logs  Show logged prompts, similarity checks, and executed skills.",
-        "/exit        Exit the agent.",
-    ]
+HELP_DETAILS = (
+    "Commands:\n"
+    "/help        Show this help message.\n"
+    "/memory      Show the agent's distilled working memory.\n"
+    "/session     Show the path to the saved session file.\n"
+    "/reset       Clear the current session history and memory.\n"
+    "/skills      List the agent skills that were discovered.\n"
+    "/skill       Activate a skill: /skill <name> [request] (or /<name> [request]).\n"
+    "/skill-logs  Show logged prompts, similarity checks, and executed skills.\n"
+    "/exit        Exit the agent."
 )
 MAX_TOOL_OUTPUT = 4000
 MAX_HISTORY = 12000
@@ -47,9 +45,15 @@ NAMED_SUBAGENT_STEPS = 8  # default budget for delegate(agent=...)
 MIN_NAMED_SUBAGENT_STEPS = 6  # floor: write + check + fix + recheck + final must fit
 MIN_PROMPT_MATCH_SCORE = 3
 SKILL_STOPWORDS = frozenset(
-    "a an the and or of to in on for with without my our your me you i it its is are be this that these those "
-    "please can could would should will when whenever use used using user users ask asks asked need needs want wants "
-    "help any all so as at by from into about then than if do does did what how also new get make".split()
+    [
+        "a", "an", "the", "and", "or", "of", "to", "in", "on", "for", "with", "without",
+        "my", "our", "your", "me", "you", "i", "it", "its", "is", "are", "be", "this",
+        "that", "these", "those", "please", "can", "could", "would", "should", "will",
+        "when", "whenever", "use", "used", "using", "user", "users", "ask", "asks", "asked",
+        "need", "needs", "want", "wants", "help", "any", "all", "so", "as", "at", "by",
+        "from", "into", "about", "then", "than", "if", "do", "does", "did", "what", "how",
+        "also", "new", "get", "make",
+    ]
 )
 
 ##############################
@@ -115,7 +119,7 @@ class WorkspaceContext:
                     timeout=5,
                 )
                 return result.stdout.strip() or fallback
-            except Exception:
+            except (OSError, subprocess.SubprocessError):
                 return fallback
 
         repo_root = Path(git(["rev-parse", "--show-toplevel"], str(cwd))).resolve()
@@ -391,8 +395,11 @@ class SkillRegistry:
             candidates.append(details)
         candidates.sort(key=lambda item: (-item["score"], -item["cosine_similarity"], item["skill"]))
 
-        eligible = [item for item in candidates if not item["already_active"] and item["matched"]]
-        best = self.skills[eligible[0]["skill"]] if eligible else None
+        top = candidates[0] if candidates else None
+        if top and top["matched"] and not top["already_active"]:
+            best = self.skills[top["skill"]]
+        else:
+            best = None
         report = {
             "method": "weighted_token_overlap_and_cosine",
             "threshold": MIN_PROMPT_MATCH_SCORE,
@@ -439,6 +446,7 @@ class OllamaModelClient:
             "raw": False,
             "think": False,
             "options": {
+                "num_ctx": 8192,
                 "num_predict": max_new_tokens,
                 "temperature": self.temperature,
                 "top_p": self.top_p,
@@ -601,15 +609,13 @@ class MiniAgent:
             risk = "approval required" if tool["risky"] else "safe"
             tool_lines.append(f"- {name}({fields}) [{risk}] {tool['description']}")
         tool_text = "\n".join(tool_lines)
-        examples = "\n".join(
-            [
-                '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
-                '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
-                '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
-                '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
-                '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
-                "<final>Done.</final>",
-            ]
+        examples = (
+            '<tool>{"name":"list_files","args":{"path":"."}}</tool>\n'
+            '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>\n'
+            '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>\n'
+            '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>\n'
+            '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>\n'
+            "<final>Done.</final>"
         )
         rule_lines = [
             "- Use tools instead of guessing about the workspace.",
@@ -636,7 +642,7 @@ class MiniAgent:
                 "- Instructions of active skills appear under Active skills in the prompt; follow them step by step.",
             ]
             example_skill = self.skills.names()[0]
-            examples += "\n" + '<tool>{"name":"use_skill","args":{"skill":"%s"}}</tool>' % example_skill
+            examples += f"\n<tool>{{\"name\":\"use_skill\",\"args\":{{\"skill\":\"{example_skill}\"}}}}</tool>"
         sections += ["Rules:\n" + "\n".join(rule_lines), "Tools:\n" + tool_text]
         if self.skills:
             sections.append("Skills:\n" + self.skills.catalog_text())
@@ -775,7 +781,7 @@ class MiniAgent:
             return f"error: unknown tool '{name}'"
         try:
             self.validate_tool(name, args)
-        except Exception as exc:
+        except (KeyError, TypeError, ValueError, OSError) as exc:
             example = self.tool_example(name)
             message = f"error: invalid arguments for {name}: {exc}"
             if example:
@@ -787,7 +793,7 @@ class MiniAgent:
             return f"error: approval denied for {name}"
         try:
             return clip(tool["run"](args))
-        except Exception as exc:
+        except (KeyError, TypeError, ValueError, OSError, subprocess.SubprocessError, RuntimeError) as exc:
             return f"error: tool {name} failed: {exc}"
 
     def repeated_tool_call(self, name, args):
@@ -907,7 +913,7 @@ class MiniAgent:
             body = MiniAgent.extract(raw, "tool")
             try:
                 payload = json.loads(body)
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 return "retry", MiniAgent.retry_notice("model returned malformed tool JSON")
             if not isinstance(payload, dict):
                 return "retry", MiniAgent.retry_notice("tool payload must be a JSON object")
@@ -1080,6 +1086,7 @@ class MiniAgent:
                 cwd=self.root,
                 capture_output=True,
                 text=True,
+                check=False,
             )
             return result.stdout.strip() or result.stderr.strip() or "(no matches)"
 
@@ -1110,6 +1117,7 @@ class MiniAgent:
             capture_output=True,
             text=True,
             timeout=timeout,
+            check=False,
         )
         return "\n".join(
             [
@@ -1313,9 +1321,12 @@ class MiniAgent:
                     continue
                 seen.add(directory)
                 for item in sorted(directory.iterdir()):
-                    if item.is_file() and item.suffix.lower() == ".md":
-                        if normalize_skill_name(item.stem) == target:
-                            return item
+                    if (
+                        item.is_file()
+                        and item.suffix.lower() == ".md"
+                        and normalize_skill_name(item.stem) == target
+                    ):
+                        return item
             except OSError:
                 continue
         return None
@@ -1538,7 +1549,7 @@ def main(argv=None):
         try:
             user_input = input("\nmini-coding-agent> ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("")
+            print()
             return 0
 
         if not user_input:
